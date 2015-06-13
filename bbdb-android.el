@@ -76,10 +76,34 @@
 (require 'bbdb-vcard)
 (require 'hex-util)
 
+(defgroup bbdb-android nil
+  "Customizations for bbdb-android"
+  :group 'bbdb)
+
+(defcustom bbdb-android-directory-alist
+  '((host . "~/BBDB/")
+    (android . "/sdcard/BBDB/"))
+  "The directorys used by bbdb-android,
+under which imported/exported files are stored.
+
+Note: User should regular cleaning by hand."
+  :group 'bbdb-vcard)
+
+(defcustom bbdb-android-adb-program "adb"
+  "adb program used by bbdb-android."
+  :type 'string
+  :group 'bbdb-android)
+
+(defcustom bbdb-android-sqlite3-program "sqlite3"
+  "sqlite3 program used by bbdb-android."
+  :type 'string
+  :group 'bbdb-android)
 
 (defun bbdb-android-adb-connect-p ()
   "Test adb connect."
-  (not (= 1 (shell-command "adb devices"))))
+  (when (executable-find bbdb-android-adb-program)
+    (not (= 1 (shell-command
+               (format "%s devices" bbdb-android-adb-program))))))
 
 (defun bbdb-android-export ()
   "Export BBDB contacts to vcard file, push to android phone,
@@ -91,25 +115,40 @@ then import vcard file to android phone by adb."
                   (format-time-string "%Y%m%d" nil t) ".vcf"))
          (temp-vcard-file
           (concat (file-name-as-directory
-                   "~/BBDB/") vcard-file-name))
+                   (cdr (assoc 'host bbdb-android-directory-alist)))
+                  vcard-file-name))
          (remote-vcard-file
           (concat (file-name-as-directory
-                   "/sdcard/BBDB/") vcard-file-name))
+                   (cdr (assoc 'android bbdb-android-directory-alist)))
+                  vcard-file-name))
          (remote-vcard-file-2
           (concat (file-name-as-directory
-                   "file:///sdcard/BBDB/") vcard-file-name)))
+                   (concat "file://"
+                           (cdr (assoc 'android bbdb-android-directory-alist))))
+                  vcard-file-name)))
     (with-temp-buffer
       (dolist (record records)
         (insert (bbdb-vcard-from record)))
       (bbdb-vcard-write-buffer temp-vcard-file t))
     (if (not (bbdb-android-adb-connect-p))
         (message "Can't connect android device by adb command.")
+
+      ;; Push vcard file to android.
       (when (yes-or-no-p (format "Push temp vcard file to \"%s\" ? " remote-vcard-file))
-        (shell-command (format "adb push %s %s" temp-vcard-file remote-vcard-file)))
+        (shell-command (format "%s push %s %s"
+                               bbdb-android-adb-program
+                               temp-vcard-file
+                               remote-vcard-file)))
+
+      ;; Clean android contacts.
       (when (yes-or-no-p "Delete all android contacts before import vcard file? ")
-        (shell-command "adb shell pm clear com.android.providers.contacts"))
+        (shell-command (format "%s shell pm clear com.android.providers.contacts"
+                               bbdb-android-adb-program)))
+
+      ;; launch android vcard importer app by adb.
       (when (yes-or-no-p (format "Import vcard file: \"%s\" ? " remote-vcard-file))
-        (shell-command (format "adb shell am start -t \"%s\" -d \"%s\" -a android.intent.action.VIEW"
+        (shell-command (format "%s shell am start -t \"%s\" -d \"%s\" -a android.intent.action.VIEW"
+                               bbdb-android-adb-program
                                "text/x-vcard"
                                remote-vcard-file-2))))))
 
@@ -123,24 +162,32 @@ then import vcard file to android phone by adb."
          (vcard-file-name
           (concat "android-contacts-" time-string ".vcf"))
          (temp-contacts-db-1
-          (concat (file-name-as-directory "/sdcard/BBDB/") contacts-db-file-name))
+          (concat (file-name-as-directory
+                   (cdr (assoc 'android bbdb-android-directory-alist)))
+                  contacts-db-file-name))
          (temp-contacts-db-2
-          (concat (file-name-as-directory "~/BBDB/") contacts-db-file-name))
+          (concat (file-name-as-directory
+                   (cdr (assoc 'host bbdb-android-directory-alist)))
+                  contacts-db-file-name))
          (vcard-file
-          (concat (file-name-as-directory "~/BBDB/") vcard-file-name)))
+          (concat (file-name-as-directory
+                   (cdr (assoc 'host bbdb-android-directory-alist)))
+                  vcard-file-name)))
     (if (and (bbdb-android-adb-connect-p)
              (yes-or-no-p "Do you want to import from android phone? "))
         (progn
           ;; Copy contacts database file to /sdcard directory
           ;; NOTE: This require your android *rooted*.
           (shell-command
-           (format "adb shell \"su -c 'cat %s > %s'\""
+           (format "%s shell \"su -c 'cat %s > %s'\""
+                   bbdb-android-adb-program
                    "/data/data/com.android.providers.contacts/databases/contacts2.db"
                    temp-contacts-db-1))
 
           ;; Pull contacts db file to computer
           (shell-command
-           (format "adb pull %s %s"
+           (format "%s pull %s %s"
+                   bbdb-android-adb-program
                    temp-contacts-db-1
                    temp-contacts-db-2))
 
@@ -150,56 +197,60 @@ then import vcard file to android phone by adb."
 
 (defun bbdb-android-import-contacts-db (db-file)
   "Import contacts in `db-file' to BBDB database."
-  (let* ((command
-          (format "sqlite3 %s \"%s\""
-                  db-file
-                  (concat "SELECT raw_contacts._id, raw_contacts.display_name, "
-                          "raw_contacts.display_name_alt, mimetypes.mimetype, "
-                          "REPLACE(REPLACE(data.data1, '\r\n', '\n'), '\n', '\n'), "
-                          "data.data2, "
-                          "REPLACE(REPLACE(data.data4, '\r\n', '\n'), '\n', '\n'), "
-                          "data.data5, data.data6, data.data7, "
-                          "data.data8, data.data9, data.data10, "
-                          "quote(data.data15)||'::::' " ;; concat "::::" as split-string separator
-                          "FROM raw_contacts, data, mimetypes "
-                          "WHERE raw_contacts.deleted = 0 "
-                          "AND raw_contacts._id = data.raw_contact_id "
-                          "AND data.mimetype_id = mimetypes._id "
-                          "ORDER BY raw_contacts._id, mimetypes._id, data.data2")))
-         (sqlite3-output (shell-command-to-string command))
-         contacts-list contacts-list2 scards-list)
+  (let ((command
+         (when (executable-find bbdb-android-sqlite3-program)
+           (format "%s %s \"%s\""
+                   bbdb-android-sqlite3-program
+                   db-file
+                   (concat "SELECT raw_contacts._id, raw_contacts.display_name, "
+                           "raw_contacts.display_name_alt, mimetypes.mimetype, "
+                           "REPLACE(REPLACE(data.data1, '\r\n', '\n'), '\n', '\n'), "
+                           "data.data2, "
+                           "REPLACE(REPLACE(data.data4, '\r\n', '\n'), '\n', '\n'), "
+                           "data.data5, data.data6, data.data7, "
+                           "data.data8, data.data9, data.data10, "
+                           "quote(data.data15)||'::::' " ;; concat "::::" as split-string separator
+                           "FROM raw_contacts, data, mimetypes "
+                           "WHERE raw_contacts.deleted = 0 "
+                           "AND raw_contacts._id = data.raw_contact_id "
+                           "AND data.mimetype_id = mimetypes._id "
+                           "ORDER BY raw_contacts._id, mimetypes._id, data.data2"))))
+        sqlite3-output contacts-list contacts-list2 scards-list)
+    (when command
+      ;; Extract contacts info by run sqlite3 command.
+      (setq sqlite3-output (shell-command-to-string command))
 
-    ;; Convert string to lisp, like the example:
-    ;; "1|a|b::::         (("1" "a" "b")
-    ;;  1|c|d::::    -->   ("1" "c" "d")
-    ;;  1|e|f::::"         ("1" "e" "f"))
-    (setq contacts-list
-          (mapcar #'(lambda (str)
-                      (split-string str "\|"))
-                  ;; String "::::" at the end of data15 as separator.
-                  (split-string sqlite3-output "::::\n")))
+      ;; Convert string to lisp, like the example:
+      ;; "1|a|b::::         (("1" "a" "b")
+      ;;  1|c|d::::    -->   ("1" "c" "d")
+      ;;  1|e|f::::"         ("1" "e" "f"))
+      (setq contacts-list
+            (mapcar #'(lambda (str)
+                        (split-string str "\|"))
+                    ;; String "::::" at the end of data15 as separator.
+                    (split-string sqlite3-output "::::\n")))
 
-    ;; Convert list to alist, like the example:
-    ;; (("1" "a" "b")       ("1" (("a" "b")
-    ;;  ("1" "c" "d")   ->        ("c" "d")
-    ;;  ("1" "e" "f"))            ("e" "f")))
-    (dolist (contact contacts-list)
-      (let* ((key (car contact))
-             (value (cdr contact)))
-        (if (assoc key contacts-list2)
-            (push value (car (cdr (assoc key contacts-list2))))
-          (push `(,key (,value)) contacts-list2))))
+      ;; Convert list to alist, like the example:
+      ;; (("1" "a" "b")       ("1" (("a" "b")
+      ;;  ("1" "c" "d")   ->        ("c" "d")
+      ;;  ("1" "e" "f"))            ("e" "f")))
+      (dolist (contact contacts-list)
+        (let* ((key (car contact))
+               (value (cdr contact)))
+          (if (assoc key contacts-list2)
+              (push value (car (cdr (assoc key contacts-list2))))
+            (push `(,key (,value)) contacts-list2))))
 
-    ;; convert to bbdb-vcard scard format.
-    (setq scards-list
-          (delq 'nil (mapcar
-                      #'(lambda (x)
-                          (bbdb-android-scardize (car (cdr x))))
-                      contacts-list2)))
+      ;; convert to bbdb-vcard scard format.
+      (setq scards-list
+            (delq 'nil (mapcar
+                        #'(lambda (x)
+                            (bbdb-android-scardize (car (cdr x))))
+                        contacts-list2)))
 
-    ;; import scards to bbdb database
-    (mapc #'bbdb-vcard-import-vcard-internal scards-list)
-    (message "Import android contacts finished.")))
+      ;; import scards to bbdb database
+      (mapc #'bbdb-vcard-import-vcard-internal scards-list)
+      (message "Import android contacts finished."))))
 
 
 ;; ** Contact-list converter
@@ -367,7 +418,8 @@ then import vcard file to android phone by adb."
   (if (bbdb-android-adb-connect-p)
       (progn
         (shell-command
-         (format "adb shell am start -a android.intent.action.CALL -d tel:%s"
+         (format "%s shell am start -a android.intent.action.CALL -d tel:%s"
+                 bbdb-android-adb-program
                  phone-number))
         (message "Dia phone number: %s ..." phone-number))
     (message "Can't connect android device by adb command.")))

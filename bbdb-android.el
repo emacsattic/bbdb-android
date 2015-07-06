@@ -5,7 +5,7 @@
 ;; Author: Feng Shu <tumashu@163.com>
 ;; URL: https://github.com/tumashu/bbdb-android
 ;; Version: 0.0.1
-;; Package-Requires: ((bbdb-vcard "20150611.2336"))
+;; Package-Requires: ((bbdb-vcard "20150705.341"))
 
 ;;; License:
 
